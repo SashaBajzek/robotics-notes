@@ -1,0 +1,49 @@
+11/03/2026
+
+1. The policy pointed the arm at the table
+    The first policy I created for the xlerbot was for the right arm to start at "home" position folded up, reach out towards the table while openning it's gripper, picking up a block about 4 inches, moving towards the X piece of tape, lowering the block until it's resting on the X, releasing the gripper, then moving the arm back to "home" position while closing the gripper.  I had 5 different starting places for the block denoted by a piece of tape.
+    The first time I tried to run the pick up a block and place it policy, the robot arm rose very fast and just pointed into the air.  This is was nothing like the episodes I had recorded where I opened the gripper as I outstretched the arm and pointed towards the table and the blocks.  At first I had thought that I had forgotten to remove the camera cap again, but checking the training data, the images came through.
+
+2. The bug: a frozen arm with almost no spread (std)
+    After verifying the camera cap was off the robot, I checked if the right units were making it to the robot and they were:  the actions to the arm were saying to move to −2.7 / 15.2 (shoulder lift / elbow flex), when it was expected that the robot hold still at −108.0 / 96.6 (shoulder lift / elbow flex).
+    
+    Next, I did an offline test to see if it was the robot or the policy messing up.  I fed the first frame from one of the training data runs to the policy to see what it said should be the first action.  Since I had started all the training data runs with the robot in the "home" position and waited a little bit before starting movement, I expected the actions to say the same degree angles for each servo as about the starting position (About -110 deg / 99 degrees for the shoulder lift / elbow flex).  The policy returned −111.9 / 99.0 (shoulder lift / elbow flex).  This showed something was wrong what the robot was telling the policy.
+
+    Next I swapped live joint values into a training frame one at a time, and the left wrist roll alone, reproduced the bad answer.  This meant that something was happening to the joint values getting fed into the policy causing it to return wild values.
+
+    An inspection of the normalizer, showed that the values were getting divided by the standard deviation (std) in the pre-processing step.  Pre-processing the data helps to normalize what the neural net sees so that the weights can be created properly.  A "how unsual score" is created and used in the training of the policy and on the rollout data fed into the policy with the range of "how unusual score" being +- 2 for this policy. Std is the typical distance from the average value.  Because the left arm of the robot was not moving, it's std was 0 or with rounding residue: 1.48e-06 (0.00000148).  Lerobot adds a very tiny number eps to the std to make sure there's no division by zero (which would make the number infinity), but eps is only 0.00000001, so the std stayed about 0.00000148.
+
+    When the robot policy ran, the observation.state for the left wrist roll said it was 1.1 deg which is (1.3 - 1.1 = 0.2) 0.2 degrees off it's training average (the servo sat at 1.3 deg the whole time during training), which is normal jitter for the servos in this robot.  "How unsual score" = (live reading − training average) ÷ std.  This number was divided by the 0.00000148 std in pre-processing, creating a "how unusual score" number of (1.1 deg - 1.3 deg) / 0.00000148 = -135,000 which is wayyy larger than the usual scores of +-2. This very absurd score completely threw off the robot when it tried to run the policy.
+
+3. The fix: a floor on observation.state std
+    The fix for this is to pick a floor value for the observation.state std that better aligns with what the robot is actually doing.  The left arm which was never told to move, roughly had a max value encoder drift of 2 ticks (0.176 deg) and the robot had seen 0.2 degrees of jitter.  So the std should make it so roughly 0.176 deg + 0.2 deg = 0.376 deg plus some margin would keep the "how unusual score" in the normal +-2 range.
+    On the flip side, the std floor number should not be larger than the std of the servos that were actually moving (14.4 or more).
+    An std floor of 1 was chosen.  So for a servo that shouldn't move: "how unusual score" = (0.376deg) / 1 = 0.376 which is well within +-2.
+
+    The script add_std_floor.py runs new_stds = [max(1.0, x) for x in original_stds] which makes it so any observation.state std less than 1 is set to 1.  This handles the fix for the pre-processing step of policy training and for policy running.  I then retrained the model with the floored stds states that it would see from observation.state.
+
+    On the flip side, when the policy being run on the robot and post-processing is run to get the actions the robot should take, a different set of action stds is used.  The policy outputs 16 scores, one per joint, and the post processor uses "how unusual is this action score" × action std + average to get the action.  Since multiplication is used instead of division, a floor is not needed.  This keeps joints that shouldn't move at their average position, like the wheel base who's average velocotiy is 0 and action std is 0: score * 0 + 0 = 0.  A floor would have turned model errors into motion, so only observation.state stds are floored.
+
+4. The soft start was fighting the plan
+
+    When I tried running the newly trained policy on the robot, the robot exhibited a new, unexpected behavior:  it opened the gripper gradually, but instead of reaching forward towards the block, it unfolded slowly, opened the gripper, then pointed straight down at the table just in front of the base.  The log had 200 soft start warnings and the run ended before 8 seconds.
+
+    I then repeated the same offline check I did before, feeding the policy the first frame from the first recorded training run and it correctly returned that the arm should not move for the first frame.  This showed that the std fix had worked.
+
+    I then checked the rollout log which showed the shoulder lift / elbow flex targets went −95 / 85 → +65 / −25 over ~3 s, which matches the demos' reach.
+
+    That meant that something was happening between the plan actions and the actions supplied to the robot.
+
+    At this time, there was a soft start in the code for the first 8 seconds of a run.  The soft start released each joint individually when it was within a certain delta (5 degrees) from position to goal.  The joints that were still clamped were only allowed to move 2 degrees from their current position to the goal position.  When the run happened, the shoulder joint came within the 5 degrees of it's goal at the 3.3 s mark, so it was released from the clamping and went straight to position the policy set while the rest of the joints were still clamped to moving 2 degrees at a time.  This is the most likely explanation for the awkward motion and positioning where the elbow stayed bent and the shoulder moved relatively quickly, pointing the arm at the table.
+
+5. A tripwire instead, and the first pick and place
+
+    The soft start was originally added because I had just started recording datasets for the first time and I didn't understand when the follower arms were going to move to match the positioning of the leader arms.  I hadn't started the leader and follower arms in the same place, and the follower arms lunged very quickly to match the position of the leader arms.  This felt unsafe for the servos and for making sure the arms weren't going to crash into themselves or the camera tower.  The idea of the soft start was if the follower arms were far from the leader arms, they would slowly and safely move to the leader position.
+
+    Since that time, I've gotten very comfortable with recording datasets, and I have built a habit of positioning both sets of arms in the "home" position before an episode.  And revisiting the logic of the "soft start", I realized that it was no longer helpful, especially with knowing when a policy is running on the robot, the actions come in batches of 100 actions all queued up that have no context that the robot motion is being clamped, causing the robot position to fall further and further behind until the 8 second mark is hit and then the robot would snap to where the policy says it should be, in a fast lunging action that I wanted to avoid in the first place.
+
+    Instead of just removing the soft start and leaving the robot open to potentially damaging motions if a bug causes the robot to move wildly, I wanted to create a tripwire that would stop the robot if something like that were to happen.  I set the tripwire of trip_deg = 30.0 deg and trip_camera = 5 units in the config_xlerobot_2wheels.py.  The tripwire stops the run with an error listing which servos tripped it and by how much.  This is much more preferable, failing with information instead of hiding the error and having a robot moving in potentially dangerous positions.
+
+    First, I tested the tripwire offline, making sure that it would stop a run and give the correct errors.  And I tested a teleop run moving the arms as fast as I would feel comfortable with them moving, and it did not trip the tripwire, so the 30 deg was a good number.
+
+    Then I reran the policy.  The arm moved towards the block, openning the gripper, attempted to pick up the block, but failed.  It went back to the block, picked it up and moved to towards the X, but about 2 inches away.  It set the block down, then moved back to "home" position and closed the gripper.
