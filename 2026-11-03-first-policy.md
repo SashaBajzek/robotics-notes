@@ -1,6 +1,6 @@
 11/03/2026
 
-1. The policy pointed the arm at the table
+1. The scenario: a pick and place policy that didn't match its training
     The first policy I created for the xlerbot was for the right arm to start at "home" position folded up, reach out towards the table while openning it's gripper, picking up a block about 4 inches, moving towards the X piece of tape, lowering the block until it's resting on the X, releasing the gripper, then moving the arm back to "home" position while closing the gripper.  I had 5 different starting places for the block denoted by a piece of tape.
     The first time I tried to run the pick up a block and place it policy, the robot arm rose very fast and just pointed into the air.  This is was nothing like the episodes I had recorded where I opened the gripper as I outstretched the arm and pointed towards the table and the blocks.  At first I had thought that I had forgotten to remove the camera cap again, but checking the training data, the images came through.
 
